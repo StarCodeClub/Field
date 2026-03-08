@@ -1,0 +1,37 @@
+# Field Plugin Configuration
+
+[general]
+prefix = "<gradient:#ff6b6b:#ee5a24>Field</gradient> <dark_gray>» <reset>"
+vanish-on-startup = false
+log-blocked-connections = true
+
+[rate-limit]
+# Max new TCP connections per IP per second. 0 = disabled
+max-connections-per-second = 4
+# Action: "close" = silently close, "ban" = auto-ban the IP
+exceed-action = "close"
+# Auto-ban duration when action is "ban" (e.g. "5m", "1h", "permanent")
+auto-ban-duration = "5m"
+
+[messages]
+no-permission = "<red>You do not have permission to use this command."
+player-not-found = "<red>Target not found or not online: <white>{target}"
+ip-banned = "<green>Banned IP: <white>{ip}"
+ip-unbanned = "<green>Unbanned IP: <white>{ip}"
+name-banned = "<green>Banned player name: <white>{name}"
+name-unbanned = "<green>Unbanned player name: <white>{name}"
+not-banned = "<yellow><white>{target}</white> is not banned."
+vanish-enabled = "<green>Vanish mode <white>enabled</white>. All connections dropped."
+vanish-disabled = "<green>Vanish mode <white>disabled</white>. Server accepting connections."
+kicked-player = "<green>Force-disconnected player <white>{player}</white>."
+kicked-ip = "<green>Force-disconnected IP <white>{ip}</white>. ({count} closed)"
+config-reloaded = "<green>Configuration and whitelist reloaded."
+already-banned = "<yellow><white>{target}</white> is already banned."
+banlist-cleared = "<green>All bans cleared. ({count} removed)"
+rate-limited = "<yellow>Rate limited IP: <white>{ip}</white> ({count}/s)"
+whitelist-added = "<green>Added <white>{ip}</white> to vanish whitelist."
+whitelist-removed = "<green>Removed <white>{ip}</white> from vanish whitelist."
+whitelist-not-found = "<yellow><white>{ip}</white> is not in the whitelist."
+
+[database]
+file = "bans.db"
