@@ -1,6 +1,7 @@
-# Field
+# Field (场)
 
-A Velocity 3.4.0 proxy plugin that provides TCP-level connection control. Unlike conventional ban plugins that send disconnect packets, Field operates at the Netty pipeline layer to reject connections before any Minecraft protocol data is exchanged — making the server appear completely offline to blocked clients.
+A Velocity 3.4.0 proxy plugin that provides TCP-level connection control. Unlike conventional ban plugins that send disconnect packets, Field operates at the Netty pipeline layer to reject connections before any Minecraft protocol data is exchanged — making the server appear completely offline to blocked clients.  
+`一个适用于 Velocity 3.4.0 的代理端插件，可提供 TCP 级别的连接控制。与发送断开连接数据包的传统封禁插件不同，本插件在 Netty 管道层运行，能在任何 Minecraft 协议进行数据交换之前拒绝连接 ——— 使服务器在被阻止的客户端中展示出逼真的离线状态。`
 
 ## How It Works
 
