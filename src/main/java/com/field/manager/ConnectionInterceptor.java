@@ -29,11 +29,9 @@ public class ConnectionInterceptor {
 
     private Object originalInitializer;
     private Object initializerHolder;
+    private Field initializerField;
 
-    // Rate limiting: IP -> RateBucket
     private final ConcurrentHashMap<String, RateBucket> rateLimitMap = new ConcurrentHashMap<>();
-
-    // Total active connection count
     private final AtomicInteger totalConnectionCount = new AtomicInteger(0);
 
     public ConnectionInterceptor(FieldPlugin plugin, ProxyServer server, Logger logger) {
@@ -50,14 +48,9 @@ public class ConnectionInterceptor {
         final AtomicInteger count = new AtomicInteger(0);
         final AtomicLong windowStart = new AtomicLong(System.currentTimeMillis());
 
-        /**
-         * Increment and check if over limit. Returns current count in window.
-         */
         int incrementAndGet() {
             long now = System.currentTimeMillis();
-            long start = windowStart.get();
-            if (now - start >= 1000) {
-                // New window
+            if (now - windowStart.get() >= 1000) {
                 count.set(1);
                 windowStart.set(now);
                 return 1;
@@ -66,23 +59,17 @@ public class ConnectionInterceptor {
         }
     }
 
-    /**
-     * Check rate limit for an IP. Returns true if the connection should be BLOCKED.
-     */
     private boolean checkRateLimit(String ip) {
         int maxPerSec = plugin.getConfig().getMaxConnectionsPerSecond();
-        if (maxPerSec <= 0 || ip == null) return false; // disabled
+        if (maxPerSec <= 0 || ip == null) return false;
 
         RateBucket bucket = rateLimitMap.computeIfAbsent(ip, k -> new RateBucket());
         int count = bucket.incrementAndGet();
 
         if (count > maxPerSec) {
-            // Exceeded
             if (plugin.getConfig().isLogBlockedConnections()) {
                 logger.info("[Field] RATE LIMITED {} ({}/s > {})", ip, count, maxPerSec);
             }
-
-            // Auto-ban if configured
             if ("ban".equalsIgnoreCase(plugin.getConfig().getExceedAction())) {
                 long duration = BanManager.parseDuration(plugin.getConfig().getAutoBanDuration());
                 if (!plugin.getBanManager().isIpBanned(ip)) {
@@ -90,35 +77,28 @@ public class ConnectionInterceptor {
                     logger.info("[Field] Auto-banned {} for rate limit violation", ip);
                 }
             }
-
             return true;
         }
         return false;
     }
 
-    /**
-     * Periodically clean stale rate limit entries.
-     */
     private void startRateLimitCleanup() {
         plugin.getServer().getScheduler()
                 .buildTask(plugin, () -> {
                     long now = System.currentTimeMillis();
-                    rateLimitMap.entrySet().removeIf(entry ->
-                            now - entry.getValue().windowStart.get() > 10_000);
+                    rateLimitMap.entrySet().removeIf(e -> now - e.getValue().windowStart.get() > 10_000);
                 })
                 .repeat(10, TimeUnit.SECONDS)
                 .schedule();
     }
 
     // =====================================================================
-    //  Injection
+    //  Injection entry point
     // =====================================================================
 
     public void inject() {
         try {
-            Object velocityServer = server;
-
-            Object connectionManager = findConnectionManager(velocityServer);
+            Object connectionManager = findConnectionManager(server);
             if (connectionManager == null) {
                 logger.error("[Field] Cannot locate ConnectionManager. Netty injection FAILED.");
                 return;
@@ -132,7 +112,7 @@ public class ConnectionInterceptor {
 
             if (wrapped) {
                 injected = true;
-                logger.info("[Field] Netty interceptor installed.");
+                logger.info("[Field] Netty interceptor installed via ChannelInitializer wrapper.");
             }
 
         } catch (Exception e) {
@@ -140,17 +120,57 @@ public class ConnectionInterceptor {
         }
     }
 
+    // =====================================================================
+    //  Wrap ServerChannelInitializerHolder
+    //
+    //  Key design for ViaVersion compatibility:
+    //
+    //  ViaVersion also wraps the ServerChannelInitializerHolder AFTER us.
+    //  The chain becomes:
+    //    holder.get() -> ViaVersion wrapper -> Field wrapper -> Original
+    //
+    //  When we BLOCK a connection, we must NOT invoke the chain at all,
+    //  because ViaVersion's wrapper will try to find "minecraft-encoder"
+    //  in the pipeline (which doesn't exist since we never called the
+    //  original Velocity initializer).
+    //
+    //  When we ALLOW a connection, we must delegate to whatever is
+    //  CURRENTLY in the holder (which includes ViaVersion's wrapper).
+    //  But since we ARE the wrapper in the holder (or ViaVersion wraps us),
+    //  we need to carefully avoid infinite recursion.
+    //
+    //  Solution: We store a reference to what was in the holder BEFORE us
+    //  (the "fallback original"). When ViaVersion wraps the holder after us,
+    //  the holder now contains ViaVersion's wrapper. On each connection:
+    //    - Read current holder value
+    //    - If it's different from ourselves -> call it (this is ViaVersion's wrapper)
+    //    - If it IS ourselves -> call the fallback original
+    //
+    //  But there's a subtlety: ViaVersion's wrapper internally calls
+    //  the "original" it captured, which is OUR wrapper. So the call chain
+    //  actually becomes:
+    //    holder.get() = ViaVersion wrapper
+    //    ViaVersion wrapper calls its captured "original" = Field wrapper
+    //    Field wrapper.initChannel() runs our checks
+    //    If allowed: Field wrapper calls fallbackOriginal (Velocity's real init)
+    //    ViaVersion's code then adds its handlers to the now-initialized pipeline
+    //
+    //  This works perfectly because:
+    //  1. Field checks run FIRST (inside our initChannel)
+    //  2. If blocked: we clear pipeline + closeForcibly, throw exception to abort
+    //  3. If allowed: we call Velocity's original, then ViaVersion adds its stuff
+    // =====================================================================
+
     private boolean wrapServerChannelInitializerHolder(Object connectionManager) {
         try {
-            Field holderField = findField(connectionManager.getClass(), "serverChannelInitializer");
-            if (holderField == null) {
-                for (Field f : getAllFields(connectionManager.getClass())) {
-                    f.setAccessible(true);
-                    Object val = f.get(connectionManager);
-                    if (val != null && val.getClass().getSimpleName().contains("ServerChannelInitializerHolder")) {
-                        holderField = f;
-                        break;
-                    }
+            // Find the holder field
+            Field holderField = null;
+            for (Field f : getAllFields(connectionManager.getClass())) {
+                f.setAccessible(true);
+                Object val = f.get(connectionManager);
+                if (val != null && val.getClass().getSimpleName().contains("ServerChannelInitializerHolder")) {
+                    holderField = f;
+                    break;
                 }
             }
 
@@ -162,66 +182,32 @@ public class ConnectionInterceptor {
             holderField.setAccessible(true);
             this.initializerHolder = holderField.get(connectionManager);
 
-            // get()
-            Method getMethod = null;
-            for (Method m : initializerHolder.getClass().getMethods()) {
-                if (m.getParameterCount() == 0
-                        && ChannelInitializer.class.isAssignableFrom(m.getReturnType())) {
-                    getMethod = m;
+            // Find the field inside the holder that stores the ChannelInitializer
+            for (Field f : getAllFields(initializerHolder.getClass())) {
+                f.setAccessible(true);
+                Object val = f.get(initializerHolder);
+                if (val instanceof ChannelInitializer<?>) {
+                    this.initializerField = f;
                     break;
                 }
             }
-            if (getMethod == null) {
-                try { getMethod = initializerHolder.getClass().getMethod("get"); }
-                catch (NoSuchMethodException ignored) {}
-            }
 
-            if (getMethod == null) {
-                for (Field f : getAllFields(initializerHolder.getClass())) {
-                    f.setAccessible(true);
-                    Object val = f.get(initializerHolder);
-                    if (val instanceof ChannelInitializer<?>) {
-                        this.originalInitializer = val;
-                        @SuppressWarnings("unchecked")
-                        ChannelInitializer<Channel> orig = (ChannelInitializer<Channel>) val;
-                        f.set(initializerHolder, createInitializerWrapper(orig));
-                        return true;
-                    }
-                }
+            // Read current initializer
+            Object currentInit = readCurrentInitializer();
+            if (!(currentInit instanceof ChannelInitializer<?>)) {
+                logger.error("[Field] Cannot read ChannelInitializer from holder.");
                 return false;
             }
-
-            getMethod.setAccessible(true);
-            Object currentInit = getMethod.invoke(initializerHolder);
-            if (!(currentInit instanceof ChannelInitializer<?>)) return false;
 
             this.originalInitializer = currentInit;
             @SuppressWarnings("unchecked")
             ChannelInitializer<Channel> original = (ChannelInitializer<Channel>) currentInit;
+
+            // Create wrapper
             ChannelInitializer<Channel> wrapper = createInitializerWrapper(original);
 
-            // set()
-            Method setMethod = null;
-            for (Method m : initializerHolder.getClass().getMethods()) {
-                if (m.getParameterCount() == 1 && m.getName().equals("set")) {
-                    setMethod = m;
-                    break;
-                }
-            }
-            if (setMethod != null) {
-                setMethod.setAccessible(true);
-                setMethod.invoke(initializerHolder, wrapper);
-                return true;
-            }
-
-            for (Field f : getAllFields(initializerHolder.getClass())) {
-                f.setAccessible(true);
-                if (f.get(initializerHolder) == currentInit) {
-                    f.set(initializerHolder, wrapper);
-                    return true;
-                }
-            }
-            return false;
+            // Write wrapper into the holder
+            return writeInitializer(wrapper);
 
         } catch (Exception e) {
             logger.error("[Field] Failed to wrap initializer holder", e);
@@ -230,102 +216,192 @@ public class ConnectionInterceptor {
     }
 
     /**
-     * Check if IP should be blocked considering vanish + whitelist.
+     * Read the current ChannelInitializer from the holder.
      */
-    private boolean shouldBlockConnection(String ip) {
-        // Vanish mode check (whitelist aware)
-        if (plugin.getVanishManager().isVanished()) {
-            if (ip != null && plugin.getWhitelistManager().isWhitelisted(ip)) {
-                return false; // whitelisted, allow through
+    private Object readCurrentInitializer() {
+        // Try get() method
+        try {
+            Method getMethod = findGetMethod();
+            if (getMethod != null) {
+                getMethod.setAccessible(true);
+                return getMethod.invoke(initializerHolder);
             }
-            return true; // vanish on, not whitelisted
+        } catch (Exception ignored) {}
+
+        // Try direct field
+        if (initializerField != null) {
+            try {
+                return initializerField.get(initializerHolder);
+            } catch (Exception ignored) {}
         }
 
-        // IP ban check
-        if (ip != null && plugin.getBanManager().isIpBanned(ip)) {
-            return true;
+        return null;
+    }
+
+    /**
+     * Find the get() method on the holder.
+     */
+    private Method findGetMethod() {
+        for (Method m : initializerHolder.getClass().getMethods()) {
+            if (m.getParameterCount() == 0
+                    && ChannelInitializer.class.isAssignableFrom(m.getReturnType())) {
+                return m;
+            }
+        }
+        try {
+            return initializerHolder.getClass().getMethod("get");
+        } catch (NoSuchMethodException ignored) {}
+        return null;
+    }
+
+    /**
+     * Write a new ChannelInitializer into the holder.
+     */
+    private boolean writeInitializer(ChannelInitializer<Channel> newInit) {
+        // Try set() method
+        for (Method m : initializerHolder.getClass().getMethods()) {
+            if (m.getParameterCount() == 1 && m.getName().equals("set")) {
+                try {
+                    m.setAccessible(true);
+                    m.invoke(initializerHolder, newInit);
+                    logger.info("[Field] Set wrapper via holder.set().");
+                    return true;
+                } catch (Exception ignored) {}
+            }
         }
 
+        // Try direct field
+        if (initializerField != null) {
+            try {
+                initializerField.set(initializerHolder, newInit);
+                logger.info("[Field] Set wrapper via direct field.");
+                return true;
+            } catch (Exception ignored) {}
+        }
+
+        logger.error("[Field] Cannot write wrapper to holder.");
         return false;
     }
 
-    private ChannelInitializer<Channel> createInitializerWrapper(ChannelInitializer<Channel> original) {
-        return new ChannelInitializer<>() {
+    /**
+     * Check if this IP should be blocked.
+     */
+    private boolean shouldBlockConnection(String ip) {
+        if (plugin.getVanishManager().isVanished()) {
+            return ip == null || !plugin.getWhitelistManager().isWhitelisted(ip);
+        }
+        return ip != null && plugin.getBanManager().isIpBanned(ip);
+    }
+
+    /**
+     * Creates the wrapper ChannelInitializer.
+     *
+     * @param fallbackOriginal The initializer that was in the holder when we wrapped it.
+     *                         Used as fallback when no other plugin has re-wrapped after us.
+     */
+    private ChannelInitializer<Channel> createInitializerWrapper(ChannelInitializer<Channel> fallbackOriginal) {
+        final ChannelInitializer<Channel> self;
+        self = new ChannelInitializer<>() {
             @Override
             protected void initChannel(Channel ch) throws Exception {
                 String ip = extractIp(ch.remoteAddress());
 
-                // Rate limit check
+                // === Check: rate limit ===
                 if (checkRateLimit(ip)) {
-                    ch.close();
+                    rejectChannel(ch);
                     return;
                 }
 
-                // Vanish + Ban check
+                // === Check: vanish + ban ===
                 if (shouldBlockConnection(ip)) {
                     if (plugin.getConfig().isLogBlockedConnections()) {
                         String reason = plugin.getVanishManager().isVanished() ? "vanish" : "banned";
                         logger.info("[Field] INIT REJECT {} ({})", ip != null ? ip : "unknown", reason);
                     }
-                    ch.close();
+                    rejectChannel(ch);
                     return;
                 }
 
-                // Call original
-                Method initMethod = ChannelInitializer.class.getDeclaredMethod("initChannel", Channel.class);
-                initMethod.setAccessible(true);
-                initMethod.invoke(original, ch);
+                // === Connection ALLOWED ===
+                // Call the original Velocity initializer (NOT the current holder value,
+                // because ViaVersion calls us as part of its chain — if we read the holder
+                // we'd get ViaVersion's wrapper and cause infinite recursion).
+                invokeInitializer(fallbackOriginal, ch);
 
+                // Add our ongoing filter if channel survived initialization
                 if (ch.isActive()) {
                     totalConnectionCount.incrementAndGet();
                     ch.closeFuture().addListener(f -> totalConnectionCount.decrementAndGet());
-
                     if (ip != null) trackChannel(ip, ch);
-                    ch.pipeline().addFirst("field-connection-filter", new ChildChannelHandler(ip));
+                    try {
+                        ch.pipeline().addFirst("field-connection-filter", new ChildChannelHandler(ip));
+                    } catch (Exception ignored) {}
                 }
             }
         };
+        return self;
+    }
+
+    /**
+     * Reject a channel completely.
+     * 1. Clear all handlers from pipeline — prevents ViaVersion's handlerAdded()
+     *    callback from finding "minecraft-encoder" and throwing NoSuchElementException.
+     * 2. Close the underlying socket forcibly — no async close, no further events.
+     */
+    private static void rejectChannel(Channel ch) {
+        // Step 1: Strip the pipeline clean
+        try {
+            ChannelPipeline pipeline = ch.pipeline();
+            List<String> names = new ArrayList<>(pipeline.names());
+            for (String name : names) {
+                try {
+                    pipeline.remove(name);
+                } catch (Exception ignored) {}
+            }
+        } catch (Exception ignored) {}
+
+        // Step 2: Forcibly close the socket
+        try {
+            ch.unsafe().closeForcibly();
+        } catch (Exception e) {
+            try { ch.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * Invoke a ChannelInitializer's protected initChannel method via reflection.
+     */
+    private static void invokeInitializer(ChannelInitializer<Channel> initializer, Channel ch) throws Exception {
+        Method initMethod = ChannelInitializer.class.getDeclaredMethod("initChannel", Channel.class);
+        initMethod.setAccessible(true);
+        initMethod.invoke(initializer, ch);
     }
 
     // =====================================================================
-    //  ServerChannel scan + boss pipeline
+    //  Boss pipeline injection (TCP accept level)
     // =====================================================================
 
     private void scheduleServerChannelScan(Object connectionManager) {
-        plugin.getServer().getScheduler()
-                .buildTask(plugin, () -> scanForServerChannels(connectionManager))
-                .delay(2, TimeUnit.SECONDS).schedule();
-        plugin.getServer().getScheduler()
-                .buildTask(plugin, () -> scanForServerChannels(connectionManager))
-                .delay(5, TimeUnit.SECONDS).schedule();
+        for (int delay : new int[]{2, 5, 10, 20}) {
+            plugin.getServer().getScheduler()
+                    .buildTask(plugin, () -> scanForServerChannels(connectionManager))
+                    .delay(delay, TimeUnit.SECONDS)
+                    .schedule();
+        }
     }
 
     private void scanForServerChannels(Object connectionManager) {
         try {
             List<ServerChannel> found = new ArrayList<>();
-            for (Field f : getAllFields(connectionManager.getClass())) {
-                try {
-                    f.setAccessible(true);
-                    Object val = f.get(connectionManager);
-                    if (val == null) continue;
-                    if (val.getClass().getSimpleName().contains("Multimap")) {
-                        scanMultimap(val, found);
-                    } else if (val instanceof Map<?, ?> map) {
-                        for (Object v : map.values())
-                            findServerChannelsInObject(v, found, 3, new HashSet<>());
-                    } else if (val instanceof Collection<?> col) {
-                        for (Object v : col)
-                            findServerChannelsInObject(v, found, 3, new HashSet<>());
-                    }
-                } catch (Exception ignored) {}
-            }
+            deepScanForServerChannels(connectionManager, found, 5, new IdentityHashMap<>());
 
             for (ServerChannel sc : found) {
                 if (!injectedServerChannels.contains(sc)) {
                     injectServerChannel(sc);
                     injectedServerChannels.add(sc);
                     injected = true;
-                    logger.info("[Field] Boss-pipeline injected: {}", sc.localAddress());
+                    logger.info("[Field] Boss-pipeline injected into ServerChannel: {} (type: {})",
+                            sc.localAddress(), sc.getClass().getSimpleName());
                 }
             }
         } catch (Exception e) {
@@ -333,54 +409,104 @@ public class ConnectionInterceptor {
         }
     }
 
-    private void scanMultimap(Object multimap, List<ServerChannel> result) {
-        try {
-            Method valuesMethod = findMethod(multimap.getClass(), "values", 0);
-            if (valuesMethod != null) {
-                valuesMethod.setAccessible(true);
-                Object values = valuesMethod.invoke(multimap);
-                if (values instanceof Collection<?> col) {
-                    for (Object endpoint : col)
-                        findServerChannelsInObject(endpoint, result, 3, new HashSet<>());
-                }
-            }
-        } catch (Exception ignored) {}
-    }
+    /**
+     * Recursively scan an object graph for ServerChannel instances.
+     * Handles Guava Multimap, Map, Collection, ChannelFuture, and plain fields.
+     */
+    private void deepScanForServerChannels(Object obj, List<ServerChannel> result,
+                                           int depth, IdentityHashMap<Object, Boolean> visited) {
+        if (depth <= 0 || obj == null || visited.containsKey(obj)) return;
+        visited.put(obj, Boolean.TRUE);
 
-    private void findServerChannelsInObject(Object obj, List<ServerChannel> result,
-                                            int depth, Set<Object> visited) {
-        if (depth <= 0 || obj == null || visited.contains(obj)) return;
-        visited.add(obj);
-        if (obj instanceof ServerChannel sc) { if (!result.contains(sc)) result.add(sc); return; }
+        // Direct matches
+        if (obj instanceof ServerChannel sc) {
+            if (!result.contains(sc)) result.add(sc);
+            return;
+        }
         if (obj instanceof ChannelFuture cf) {
             Channel ch = cf.channel();
             if (ch instanceof ServerChannel sc && !result.contains(sc)) result.add(sc);
             return;
         }
-        if (obj instanceof Channel) return;
-        if (isJdkType(obj.getClass())) return;
+        if (obj instanceof Channel) return; // Non-server channel, skip
 
-        for (Field f : getAllFields(obj.getClass())) {
+        Class<?> clazz = obj.getClass();
+        String className = clazz.getName();
+
+        // Skip JDK internals
+        if (className.startsWith("java.") || className.startsWith("javax.")
+                || className.startsWith("sun.") || className.startsWith("jdk.")
+                || clazz.isPrimitive() || clazz.isEnum() || clazz.isArray()) {
+            return;
+        }
+
+        // Guava Multimap — use reflection to call values()
+        if (className.contains("Multimap") || className.contains("AbstractMultimap")) {
+            try {
+                Method valuesMethod = null;
+                for (Method m : clazz.getMethods()) {
+                    if (m.getName().equals("values") && m.getParameterCount() == 0) {
+                        valuesMethod = m;
+                        break;
+                    }
+                }
+                if (valuesMethod != null) {
+                    valuesMethod.setAccessible(true);
+                    Object values = valuesMethod.invoke(obj);
+                    if (values instanceof Collection<?> col) {
+                        for (Object item : col) {
+                            deepScanForServerChannels(item, result, depth - 1, visited);
+                        }
+                    }
+                }
+            } catch (Exception ignored) {}
+            return; // Don't scan Multimap's internal fields
+        }
+
+        // Standard Map
+        if (obj instanceof Map<?, ?> map) {
+            for (Object v : map.values()) {
+                deepScanForServerChannels(v, result, depth - 1, visited);
+            }
+            return;
+        }
+
+        // Standard Collection / Iterable
+        if (obj instanceof Iterable<?> iter) {
+            for (Object item : iter) {
+                deepScanForServerChannels(item, result, depth - 1, visited);
+            }
+            return;
+        }
+
+        // Scan declared fields
+        for (Field f : getAllFields(clazz)) {
             try {
                 f.setAccessible(true);
                 Object val = f.get(obj);
-                if (val == null || visited.contains(val)) continue;
-                if (val instanceof ServerChannel sc) { if (!result.contains(sc)) result.add(sc); }
-                else if (val instanceof ChannelFuture cf) {
+                if (val == null || visited.containsKey(val)) continue;
+
+                if (val instanceof ServerChannel sc) {
+                    if (!result.contains(sc)) result.add(sc);
+                } else if (val instanceof ChannelFuture cf) {
                     Channel ch = cf.channel();
                     if (ch instanceof ServerChannel sc && !result.contains(sc)) result.add(sc);
-                } else if (val instanceof Channel ch) {
-                    if (ch instanceof ServerChannel sc && !result.contains(sc)) result.add(sc);
-                } else if (!isJdkType(val.getClass())) {
-                    findServerChannelsInObject(val, result, depth - 1, visited);
+                } else {
+                    deepScanForServerChannels(val, result, depth - 1, visited);
                 }
             } catch (Exception ignored) {}
         }
     }
 
+    // =====================================================================
+    //  Boss pipeline handler
+    // =====================================================================
+
     private void injectServerChannel(ServerChannel serverChannel) {
         ChannelPipeline pipeline = serverChannel.pipeline();
-        if (pipeline.get("field-acceptor") != null) pipeline.remove("field-acceptor");
+        try {
+            if (pipeline.get("field-acceptor") != null) pipeline.remove("field-acceptor");
+        } catch (Exception ignored) {}
 
         pipeline.addFirst("field-acceptor", new ChannelInboundHandlerAdapter() {
             @Override
@@ -388,13 +514,11 @@ public class ConnectionInterceptor {
                 if (msg instanceof Channel childChannel) {
                     String ip = extractIp(childChannel.remoteAddress());
 
-                    // Rate limit
                     if (checkRateLimit(ip)) {
                         closeForcibly(childChannel);
                         return;
                     }
 
-                    // Vanish + ban
                     if (shouldBlockConnection(ip)) {
                         if (plugin.getConfig().isLogBlockedConnections()) {
                             String reason = plugin.getVanishManager().isVanished() ? "vanish" : "banned";
@@ -409,17 +533,19 @@ public class ConnectionInterceptor {
         });
     }
 
+    /**
+     * Close a channel that may not be registered to an EventLoop yet.
+     */
     private static void closeForcibly(Channel channel) {
         try {
             channel.unsafe().closeForcibly();
         } catch (Exception e) {
-            try { if (channel instanceof java.io.Closeable c) c.close(); }
-            catch (Exception ignored) {}
+            try { channel.close(); } catch (Exception ignored) {}
         }
     }
 
     // =====================================================================
-    //  Child channel handler
+    //  Child channel ongoing filter
     // =====================================================================
 
     private class ChildChannelHandler extends ChannelInboundHandlerAdapter {
@@ -443,10 +569,7 @@ public class ConnectionInterceptor {
 
         @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-            if (shouldBlockConnection(ip)) {
-                ctx.close();
-                return;
-            }
+            if (shouldBlockConnection(ip)) { ctx.close(); return; }
             super.channelRead(ctx, msg);
         }
     }
@@ -472,22 +595,24 @@ public class ConnectionInterceptor {
         Set<Channel> set = activeChannels.remove(ip);
         if (set == null) return 0;
         int count = 0;
-        for (Channel ch : set) { if (ch.isActive()) { ch.close(); count++; } }
+        for (Channel ch : set) {
+            if (ch.isActive()) { ch.close(); count++; }
+        }
         return count;
     }
 
     public int forceCloseAll() {
         int count = 0;
-        for (Set<Channel> set : activeChannels.values())
-            for (Channel ch : set)
+        for (Set<Channel> set : activeChannels.values()) {
+            for (Channel ch : set) {
                 if (ch.isActive()) { ch.close(); count++; }
+            }
+        }
         activeChannels.clear();
         return count;
     }
 
-    public int getTotalConnectionCount() {
-        return totalConnectionCount.get();
-    }
+    public int getTotalConnectionCount() { return totalConnectionCount.get(); }
 
     // =====================================================================
     //  Force disconnect player
@@ -510,12 +635,14 @@ public class ConnectionInterceptor {
                 m.setAccessible(true);
                 mcConn = m.invoke(player);
             } catch (NoSuchMethodException ignored) {}
+
             if (mcConn == null) mcConn = getFieldValue(player, "connection");
             if (mcConn == null) {
                 for (Field f : getAllFields(player.getClass())) {
                     f.setAccessible(true);
                     if (f.getType().getSimpleName().contains("MinecraftConnection")) {
-                        mcConn = f.get(player); break;
+                        mcConn = f.get(player);
+                        break;
                     }
                 }
             }
@@ -546,10 +673,14 @@ public class ConnectionInterceptor {
 
     public void uninject() {
         for (Channel sc : injectedServerChannels) {
-            try { if (sc.pipeline().get("field-acceptor") != null) sc.pipeline().remove("field-acceptor"); }
-            catch (Exception ignored) {}
+            try {
+                if (sc.pipeline().get("field-acceptor") != null) {
+                    sc.pipeline().remove("field-acceptor");
+                }
+            } catch (Exception ignored) {}
         }
         injectedServerChannels.clear();
+
         if (initializerHolder != null && originalInitializer != null) {
             try {
                 for (Method m : initializerHolder.getClass().getMethods()) {
@@ -561,6 +692,7 @@ public class ConnectionInterceptor {
                 }
             } catch (Exception ignored) {}
         }
+
         activeChannels.clear();
         injected = false;
     }
@@ -569,7 +701,7 @@ public class ConnectionInterceptor {
     public Map<String, Set<Channel>> getActiveChannels() { return activeChannels; }
 
     // =====================================================================
-    //  Reflection
+    //  Reflection utilities
     // =====================================================================
 
     static String extractIp(SocketAddress address) {
@@ -587,17 +719,9 @@ public class ConnectionInterceptor {
             try {
                 f.setAccessible(true);
                 Object val = f.get(velocityServer);
-                if (val != null && val.getClass().getSimpleName().contains("ConnectionManager")) return val;
+                if (val != null && val.getClass().getSimpleName().contains("ConnectionManager"))
+                    return val;
             } catch (Exception ignored) {}
-        }
-        return null;
-    }
-
-    private static Field findField(Class<?> clazz, String name) {
-        Class<?> current = clazz;
-        while (current != null && current != Object.class) {
-            try { Field f = current.getDeclaredField(name); f.setAccessible(true); return f; }
-            catch (NoSuchFieldException ignored) { current = current.getSuperclass(); }
         }
         return null;
     }
@@ -605,16 +729,16 @@ public class ConnectionInterceptor {
     private static Object getFieldValue(Object obj, String name) {
         Class<?> clazz = obj.getClass();
         while (clazz != null && clazz != Object.class) {
-            try { Field f = clazz.getDeclaredField(name); f.setAccessible(true); return f.get(obj); }
-            catch (NoSuchFieldException e) { clazz = clazz.getSuperclass(); }
-            catch (Exception e) { return null; }
+            try {
+                Field f = clazz.getDeclaredField(name);
+                f.setAccessible(true);
+                return f.get(obj);
+            } catch (NoSuchFieldException e) {
+                clazz = clazz.getSuperclass();
+            } catch (Exception e) {
+                return null;
+            }
         }
-        return null;
-    }
-
-    private static Method findMethod(Class<?> clazz, String name, int paramCount) {
-        for (Method m : clazz.getMethods())
-            if (m.getName().equals(name) && m.getParameterCount() == paramCount) return m;
         return null;
     }
 
@@ -627,13 +751,5 @@ public class ConnectionInterceptor {
             current = current.getSuperclass();
         }
         return fields.toArray(new Field[0]);
-    }
-
-    private static boolean isJdkType(Class<?> clazz) {
-        String name = clazz.getName();
-        return name.startsWith("java.") || name.startsWith("javax.")
-                || name.startsWith("sun.") || name.startsWith("jdk.")
-                || clazz.isPrimitive() || clazz.isEnum() || clazz.isArray()
-                || name.startsWith("com.google.");
     }
 }
