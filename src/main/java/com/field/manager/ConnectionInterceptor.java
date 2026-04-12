@@ -4,6 +4,7 @@ import com.field.FieldPlugin;
 import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
 import io.netty.channel.*;
+import io.netty.util.AttributeKey;
 import org.slf4j.Logger;
 
 import java.lang.reflect.Field;
@@ -26,10 +27,15 @@ public class ConnectionInterceptor {
     private final ConcurrentHashMap<String, Set<Channel>> activeChannels = new ConcurrentHashMap<>();
     private volatile boolean injected = false;
     private final List<Channel> injectedServerChannels = Collections.synchronizedList(new ArrayList<>());
+    private static final AttributeKey<Boolean> RATE_LIMIT_CHECKED =
+            AttributeKey.valueOf("field-rate-limit-checked");
+    private static final AttributeKey<Boolean> FIELD_CHANNEL_TRACKED =
+            AttributeKey.valueOf("field-channel-tracked");
 
     private Object originalInitializer;
     private Object initializerHolder;
     private Field initializerField;
+    private volatile FieldChannelInitializer installedWrapper;
 
     private final ConcurrentHashMap<String, RateBucket> rateLimitMap = new ConcurrentHashMap<>();
     private final AtomicInteger totalConnectionCount = new AtomicInteger(0);
@@ -105,9 +111,10 @@ public class ConnectionInterceptor {
             }
             logger.info("[Field] Found ConnectionManager: {}", connectionManager.getClass().getName());
 
-            boolean wrapped = wrapServerChannelInitializerHolder(connectionManager);
+            boolean wrapped = installOrRefreshInitializerWrapper(connectionManager, false);
 
             scheduleServerChannelScan(connectionManager);
+            scheduleInitializerRefresh(connectionManager);
             startRateLimitCleanup();
 
             if (wrapped) {
@@ -123,95 +130,92 @@ public class ConnectionInterceptor {
     // =====================================================================
     //  Wrap ServerChannelInitializerHolder
     //
-    //  Key design for ViaVersion compatibility:
+    //  Velocity/ViaVersion compatibility strategy:
     //
-    //  ViaVersion also wraps the ServerChannelInitializerHolder AFTER us.
-    //  The chain becomes:
-    //    holder.get() -> ViaVersion wrapper -> Field wrapper -> Original
+    //  We want Field to remain the OUTERMOST child initializer so that a
+    //  rejected connection never reaches ViaVersion's pipeline injection.
+    //  To achieve that, we:
+    //   1. install a Field wrapper around the current initializer
+    //   2. periodically refresh the holder during startup in case another
+    //      plugin wraps after us
     //
-    //  When we BLOCK a connection, we must NOT invoke the chain at all,
-    //  because ViaVersion's wrapper will try to find "minecraft-encoder"
-    //  in the pipeline (which doesn't exist since we never called the
-    //  original Velocity initializer).
-    //
-    //  When we ALLOW a connection, we must delegate to whatever is
-    //  CURRENTLY in the holder (which includes ViaVersion's wrapper).
-    //  But since we ARE the wrapper in the holder (or ViaVersion wraps us),
-    //  we need to carefully avoid infinite recursion.
-    //
-    //  Solution: We store a reference to what was in the holder BEFORE us
-    //  (the "fallback original"). When ViaVersion wraps the holder after us,
-    //  the holder now contains ViaVersion's wrapper. On each connection:
-    //    - Read current holder value
-    //    - If it's different from ourselves -> call it (this is ViaVersion's wrapper)
-    //    - If it IS ourselves -> call the fallback original
-    //
-    //  But there's a subtlety: ViaVersion's wrapper internally calls
-    //  the "original" it captured, which is OUR wrapper. So the call chain
-    //  actually becomes:
-    //    holder.get() = ViaVersion wrapper
-    //    ViaVersion wrapper calls its captured "original" = Field wrapper
-    //    Field wrapper.initChannel() runs our checks
-    //    If allowed: Field wrapper calls fallbackOriginal (Velocity's real init)
-    //    ViaVersion's code then adds its handlers to the now-initialized pipeline
-    //
-    //  This works perfectly because:
-    //  1. Field checks run FIRST (inside our initChannel)
-    //  2. If blocked: we clear pipeline + closeForcibly, throw exception to abort
-    //  3. If allowed: we call Velocity's original, then ViaVersion adds its stuff
+    //  This allows blocked channels to be closed before any downstream
+    //  initializer (including ViaVersion) sees them. If other plugins wrap
+    //  us during startup, the refresh step re-establishes Field as the
+    //  outermost guard.
     // =====================================================================
 
-    private boolean wrapServerChannelInitializerHolder(Object connectionManager) {
+    private boolean installOrRefreshInitializerWrapper(Object connectionManager, boolean refresh) {
         try {
-            // Find the holder field
-            Field holderField = null;
-            for (Field f : getAllFields(connectionManager.getClass())) {
-                f.setAccessible(true);
-                Object val = f.get(connectionManager);
-                if (val != null && val.getClass().getSimpleName().contains("ServerChannelInitializerHolder")) {
-                    holderField = f;
-                    break;
+            if (initializerHolder == null) {
+                Field holderField = null;
+                for (Field f : getAllFields(connectionManager.getClass())) {
+                    f.setAccessible(true);
+                    Object val = f.get(connectionManager);
+                    if (val != null && val.getClass().getSimpleName().contains("ServerChannelInitializerHolder")) {
+                        holderField = f;
+                        break;
+                    }
+                }
+
+                if (holderField == null) {
+                    logger.error("[Field] Cannot find ServerChannelInitializerHolder.");
+                    return false;
+                }
+
+                holderField.setAccessible(true);
+                this.initializerHolder = holderField.get(connectionManager);
+            }
+
+            if (initializerField == null) {
+                for (Field f : getAllFields(initializerHolder.getClass())) {
+                    f.setAccessible(true);
+                    Object val = f.get(initializerHolder);
+                    if (val instanceof ChannelInitializer<?>) {
+                        this.initializerField = f;
+                        break;
+                    }
                 }
             }
 
-            if (holderField == null) {
-                logger.error("[Field] Cannot find ServerChannelInitializerHolder.");
-                return false;
-            }
-
-            holderField.setAccessible(true);
-            this.initializerHolder = holderField.get(connectionManager);
-
-            // Find the field inside the holder that stores the ChannelInitializer
-            for (Field f : getAllFields(initializerHolder.getClass())) {
-                f.setAccessible(true);
-                Object val = f.get(initializerHolder);
-                if (val instanceof ChannelInitializer<?>) {
-                    this.initializerField = f;
-                    break;
-                }
-            }
-
-            // Read current initializer
             Object currentInit = readCurrentInitializer();
             if (!(currentInit instanceof ChannelInitializer<?>)) {
                 logger.error("[Field] Cannot read ChannelInitializer from holder.");
                 return false;
             }
+            if (currentInit == installedWrapper) {
+                return true;
+            }
 
-            this.originalInitializer = currentInit;
             @SuppressWarnings("unchecked")
-            ChannelInitializer<Channel> original = (ChannelInitializer<Channel>) currentInit;
+            ChannelInitializer<Channel> delegate = (ChannelInitializer<Channel>) currentInit;
 
-            // Create wrapper
-            ChannelInitializer<Channel> wrapper = createInitializerWrapper(original);
+            if (originalInitializer == null) {
+                this.originalInitializer = currentInit;
+            }
 
-            // Write wrapper into the holder
-            return writeInitializer(wrapper);
+            FieldChannelInitializer wrapper = new FieldChannelInitializer(delegate);
+            boolean written = writeInitializer(wrapper);
+            if (written) {
+                installedWrapper = wrapper;
+                if (refresh) {
+                    logger.info("[Field] Refreshed ChannelInitializer wrapper to stay ahead of downstream handlers.");
+                }
+            }
+            return written;
 
         } catch (Exception e) {
             logger.error("[Field] Failed to wrap initializer holder", e);
             return false;
+        }
+    }
+
+    private void scheduleInitializerRefresh(Object connectionManager) {
+        for (int delay : new int[]{1, 3, 10, 30}) {
+            plugin.getServer().getScheduler()
+                    .buildTask(plugin, () -> installOrRefreshInitializerWrapper(connectionManager, true))
+                    .delay(delay, TimeUnit.SECONDS)
+                    .schedule();
         }
     }
 
@@ -293,79 +297,58 @@ public class ConnectionInterceptor {
         return ip != null && plugin.getBanManager().isIpBanned(ip);
     }
 
-    /**
-     * Creates the wrapper ChannelInitializer.
-     *
-     * @param fallbackOriginal The initializer that was in the holder when we wrapped it.
-     *                         Used as fallback when no other plugin has re-wrapped after us.
-     */
-    private ChannelInitializer<Channel> createInitializerWrapper(ChannelInitializer<Channel> fallbackOriginal) {
-        final ChannelInitializer<Channel> self;
-        self = new ChannelInitializer<>() {
-            @Override
-            protected void initChannel(Channel ch) throws Exception {
-                String ip = extractIp(ch.remoteAddress());
+    private class FieldChannelInitializer extends ChannelInitializer<Channel> {
+        private final ChannelInitializer<Channel> delegate;
 
-                // === Check: rate limit ===
+        private FieldChannelInitializer(ChannelInitializer<Channel> delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        protected void initChannel(Channel ch) throws Exception {
+            String ip = extractIp(ch.remoteAddress());
+
+            Boolean rateChecked = ch.attr(RATE_LIMIT_CHECKED).get();
+            if (!Boolean.TRUE.equals(rateChecked)) {
+                ch.attr(RATE_LIMIT_CHECKED).set(Boolean.TRUE);
                 if (checkRateLimit(ip)) {
                     rejectChannel(ch);
                     return;
                 }
-
-                // === Check: vanish + ban ===
-                if (shouldBlockConnection(ip)) {
-                    if (plugin.getConfig().isLogBlockedConnections()) {
-                        String reason = plugin.getVanishManager().isVanished() ? "vanish" : "banned";
-                        logger.info("[Field] INIT REJECT {} ({})", ip != null ? ip : "unknown", reason);
-                    }
-                    rejectChannel(ch);
-                    return;
-                }
-
-                // === Connection ALLOWED ===
-                // Call the original Velocity initializer (NOT the current holder value,
-                // because ViaVersion calls us as part of its chain — if we read the holder
-                // we'd get ViaVersion's wrapper and cause infinite recursion).
-                invokeInitializer(fallbackOriginal, ch);
-
-                // Add our ongoing filter if channel survived initialization
-                if (ch.isActive()) {
-                    totalConnectionCount.incrementAndGet();
-                    ch.closeFuture().addListener(f -> totalConnectionCount.decrementAndGet());
-                    if (ip != null) trackChannel(ip, ch);
-                    try {
-                        ch.pipeline().addFirst("field-connection-filter", new ChildChannelHandler(ip));
-                    } catch (Exception ignored) {}
-                }
             }
-        };
-        return self;
+
+            if (shouldBlockConnection(ip)) {
+                if (plugin.getConfig().isLogBlockedConnections()) {
+                    String reason = plugin.getVanishManager().isVanished() ? "vanish" : "banned";
+                    logger.info("[Field] INIT REJECT {} ({})", ip != null ? ip : "unknown", reason);
+                }
+                rejectChannel(ch);
+                return;
+            }
+
+            invokeInitializer(delegate, ch);
+
+            if (ch.isActive() && !Boolean.TRUE.equals(ch.attr(FIELD_CHANNEL_TRACKED).get())) {
+                ch.attr(FIELD_CHANNEL_TRACKED).set(Boolean.TRUE);
+                totalConnectionCount.incrementAndGet();
+                ch.closeFuture().addListener(f -> totalConnectionCount.decrementAndGet());
+                if (ip != null) trackChannel(ip, ch);
+                try {
+                    if (ch.pipeline().get("field-connection-filter") == null) {
+                        ch.pipeline().addFirst("field-connection-filter", new ChildChannelHandler(ip));
+                    }
+                } catch (Exception ignored) {}
+            }
+        }
     }
 
     /**
-     * Reject a channel completely.
-     * 1. Clear all handlers from pipeline — prevents ViaVersion's handlerAdded()
-     *    callback from finding "minecraft-encoder" and throwing NoSuchElementException.
-     * 2. Close the underlying socket forcibly — no async close, no further events.
+     * Reject a channel before delegating to downstream initializers.
+     * The outer wrapper simply closes the socket and returns without invoking
+     * ViaVersion or Velocity's real initializer.
      */
     private static void rejectChannel(Channel ch) {
-        // Step 1: Strip the pipeline clean
-        try {
-            ChannelPipeline pipeline = ch.pipeline();
-            List<String> names = new ArrayList<>(pipeline.names());
-            for (String name : names) {
-                try {
-                    pipeline.remove(name);
-                } catch (Exception ignored) {}
-            }
-        } catch (Exception ignored) {}
-
-        // Step 2: Forcibly close the socket
-        try {
-            ch.unsafe().closeForcibly();
-        } catch (Exception e) {
-            try { ch.close(); } catch (Exception ignored) {}
-        }
+        closeForcibly(ch);
     }
 
     /**
@@ -514,6 +497,7 @@ public class ConnectionInterceptor {
                 if (msg instanceof Channel childChannel) {
                     String ip = extractIp(childChannel.remoteAddress());
 
+                    childChannel.attr(RATE_LIMIT_CHECKED).set(Boolean.TRUE);
                     if (checkRateLimit(ip)) {
                         closeForcibly(childChannel);
                         return;
