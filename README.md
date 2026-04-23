@@ -77,8 +77,6 @@ TCP SYN →
       │     - IP ban
       │     - Name ban → auto-ban IP, close
       │     - Vanish (whitelist-aware)
-      │     - Per-IP online player limit
-      │       If exceeded: deny with `velocity.error.already-connected-proxy`
       │
       ├─ GameProfileRequestEvent (has UUID now)
       │   LoginListener checks:
@@ -88,7 +86,7 @@ TCP SYN →
       └─ LoginEvent
           Final checks:
             - force disconnect if banned
-            - deny join when per-IP online limit is exceeded
+            - deny join when per-IP online limit is exceeded (UUID-aware)
 ```
 
 ## Rate Limiting
@@ -116,6 +114,7 @@ Field can limit how many players from the same IP may be online at the same time
 
 - `0` = disabled
 - `n > 0` = at most `n` online players for one IP
+- Enforced at `LoginEvent` (UUID-aware) to avoid false rejects during duplicate-session replacement/reconnects
 - If a new player exceeds this limit, login is denied (not force-closed) with the Velocity localization key:
   `velocity.error.already-connected-proxy`
 

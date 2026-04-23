@@ -86,18 +86,6 @@ public class LoginListener {
             return;
         }
 
-        // Per-IP online player limit (deny with Velocity language message, do not force-close)
-        int maxOnlinePerIp = plugin.getConfig().getMaxOnlinePerIp();
-        if (maxOnlinePerIp > 0 && ip != null) {
-            int currentOnline = countOnlinePlayersByIp(ip, null);
-            if (currentOnline >= maxOnlinePerIp) {
-                event.setResult(PreLoginEvent.PreLoginComponentResult.denied(alreadyConnectedProxyMessage()));
-                if (plugin.getConfig().isLogBlockedConnections()) {
-                    logger.info("[Field] PreLogin REJECT {} (per-ip online limit: {}/{})",
-                            ip, currentOnline, maxOnlinePerIp);
-                }
-            }
-        }
     }
 
     @Subscribe(order = PostOrder.FIRST)
