@@ -4,6 +4,8 @@
 prefix = "<gradient:#ff6b6b:#ee5a24>Field</gradient> <dark_gray>» <reset>"
 vanish-on-startup = false
 log-blocked-connections = true
+# Max online players sharing the same IP. 0 = disabled
+max-online-per-ip = 0
 
 [rate-limit]
 # Max new TCP connections per IP per second. 0 = disabled

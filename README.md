@@ -77,6 +77,8 @@ TCP SYN →
       │     - IP ban
       │     - Name ban → auto-ban IP, close
       │     - Vanish (whitelist-aware)
+      │     - Per-IP online player limit
+      │       If exceeded: deny with `velocity.error.already-connected-proxy`
       │
       ├─ GameProfileRequestEvent (has UUID now)
       │   LoginListener checks:
@@ -84,7 +86,9 @@ TCP SYN →
       │     - UUID evasion: if UUID has banned IPs, auto-ban current IP
       │
       └─ LoginEvent
-          Final checks, force disconnect if banned
+          Final checks:
+            - force disconnect if banned
+            - deny join when per-IP online limit is exceeded
 ```
 
 ## Rate Limiting
@@ -105,6 +109,15 @@ Two configurable actions on exceed:
 - `ban` — close and auto-ban the IP for a configurable duration
 
 Stale buckets (no activity for 10+ seconds) are cleaned up by a periodic task.
+
+## Per-IP Online Limit
+
+Field can limit how many players from the same IP may be online at the same time (`general.max-online-per-ip`).
+
+- `0` = disabled
+- `n > 0` = at most `n` online players for one IP
+- If a new player exceeds this limit, login is denied (not force-closed) with the Velocity localization key:
+  `velocity.error.already-connected-proxy`
 
 ## Ban Storage
 
@@ -206,6 +219,7 @@ Console always has full access.
 prefix = "<gradient:#ff6b6b:#ee5a24>Field</gradient> <dark_gray>» <reset>"
 vanish-on-startup = false
 log-blocked-connections = true
+max-online-per-ip = 0
 
 [rate-limit]
 max-connections-per-second = 4

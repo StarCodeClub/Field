@@ -21,6 +21,7 @@ public class FieldConfig {
     private volatile String prefix;
     private volatile boolean vanishOnStartup;
     private volatile boolean logBlockedConnections;
+    private volatile int maxOnlinePerIp;
     private volatile int maxConnectionsPerSecond;
     private volatile String exceedAction; // "close" or "ban"
     private volatile String autoBanDuration;
@@ -59,6 +60,12 @@ public class FieldConfig {
                     flat.getOrDefault("general.vanish-on-startup", "false"));
             this.logBlockedConnections = Boolean.parseBoolean(
                     flat.getOrDefault("general.log-blocked-connections", "true"));
+            try {
+                this.maxOnlinePerIp = Integer.parseInt(
+                        flat.getOrDefault("general.max-online-per-ip", "0"));
+            } catch (NumberFormatException e) {
+                this.maxOnlinePerIp = 0;
+            }
 
             // Rate limit
             try {
@@ -152,6 +159,7 @@ public class FieldConfig {
         this.prefix = "<gradient:#ff6b6b:#ee5a24>Field</gradient> <dark_gray>» <reset>";
         this.vanishOnStartup = false;
         this.logBlockedConnections = true;
+        this.maxOnlinePerIp = 0;
         this.maxConnectionsPerSecond = 4;
         this.exceedAction = "close";
         this.autoBanDuration = "5m";
@@ -168,6 +176,8 @@ public class FieldConfig {
                 prefix = "<gradient:#ff6b6b:#ee5a24>Field</gradient> <dark_gray>» <reset>"
                 vanish-on-startup = false
                 log-blocked-connections = true
+                # Max online players with the same IP. 0 = disabled
+                max-online-per-ip = 0
                 
                 [rate-limit]
                 # Max new TCP connections per IP per second. 0 = disabled
@@ -206,6 +216,7 @@ public class FieldConfig {
     public String getPrefix() { return prefix; }
     public boolean isVanishOnStartup() { return vanishOnStartup; }
     public boolean isLogBlockedConnections() { return logBlockedConnections; }
+    public int getMaxOnlinePerIp() { return maxOnlinePerIp; }
     public int getMaxConnectionsPerSecond() { return maxConnectionsPerSecond; }
     public String getExceedAction() { return exceedAction; }
     public String getAutoBanDuration() { return autoBanDuration; }

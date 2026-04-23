@@ -18,14 +18,20 @@ import org.slf4j.Logger;
 import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
 import java.util.*;
+import java.util.Locale;
+import java.util.ResourceBundle;
 
 /**
  * Handles login events:
  * - IP ban enforcement
  * - Name ban enforcement (offline player name ban)
  * - Ban evasion detection (UUID-based)
+ * - Per-IP online player limit
  */
 public class LoginListener {
+
+    private static final String VELOCITY_LANG_BUNDLE = "com.velocitypowered.proxy.l10n.messages";
+    private static final String ALREADY_CONNECTED_PROXY_KEY = "velocity.error.already-connected-proxy";
 
     private final FieldPlugin plugin;
     private final ProxyServer server;
@@ -76,6 +82,20 @@ public class LoginListener {
             forceClose(conn);
             if (ip != null) {
                 plugin.getConnectionInterceptor().forceCloseByIp(ip);
+            }
+            return;
+        }
+
+        // Per-IP online player limit (deny with Velocity language message, do not force-close)
+        int maxOnlinePerIp = plugin.getConfig().getMaxOnlinePerIp();
+        if (maxOnlinePerIp > 0 && ip != null) {
+            int currentOnline = countOnlinePlayersByIp(ip, null);
+            if (currentOnline >= maxOnlinePerIp) {
+                event.setResult(PreLoginEvent.PreLoginComponentResult.denied(alreadyConnectedProxyMessage()));
+                if (plugin.getConfig().isLogBlockedConnections()) {
+                    logger.info("[Field] PreLogin REJECT {} (per-ip online limit: {}/{})",
+                            ip, currentOnline, maxOnlinePerIp);
+                }
             }
         }
     }
@@ -150,7 +170,61 @@ public class LoginListener {
         if (plugin.getBanManager().isIpBanned(ip)) {
             event.setResult(ResultedEvent.ComponentResult.denied(Component.empty()));
             ConnectionInterceptor.forceDisconnectPlayer(player);
+            return;
         }
+
+        // Per-IP online player limit (deny with Velocity language message, do not force-close)
+        int maxOnlinePerIp = plugin.getConfig().getMaxOnlinePerIp();
+        if (maxOnlinePerIp > 0) {
+            int currentOnline = countOnlinePlayersByIp(ip, player.getUniqueId());
+            if (currentOnline >= maxOnlinePerIp) {
+                event.setResult(ResultedEvent.ComponentResult.denied(alreadyConnectedProxyMessage()));
+                if (plugin.getConfig().isLogBlockedConnections()) {
+                    logger.info("[Field] Login REJECT {} ({}) (per-ip online limit: {}/{})",
+                            playerName, ip, currentOnline, maxOnlinePerIp);
+                }
+            }
+        }
+    }
+
+    private Component alreadyConnectedProxyMessage() {
+        return Component.text(resolveVelocityMessage(ALREADY_CONNECTED_PROXY_KEY));
+    }
+
+    private String resolveVelocityMessage(String key) {
+        ClassLoader velocityClassLoader = server.getClass().getClassLoader();
+        try {
+            ResourceBundle bundle = ResourceBundle.getBundle(
+                    VELOCITY_LANG_BUNDLE, Locale.getDefault(), velocityClassLoader);
+            if (bundle.containsKey(key)) {
+                return bundle.getString(key);
+            }
+        } catch (Exception ignored) {}
+
+        try {
+            ResourceBundle fallback = ResourceBundle.getBundle(
+                    VELOCITY_LANG_BUNDLE, Locale.ENGLISH, velocityClassLoader);
+            if (fallback.containsKey(key)) {
+                return fallback.getString(key);
+            }
+        } catch (Exception ignored) {}
+
+        return "You are already connected to this proxy!";
+    }
+
+    private int countOnlinePlayersByIp(String ip, UUID excludeUuid) {
+        if (ip == null) return 0;
+        int count = 0;
+        for (Player online : server.getAllPlayers()) {
+            if (excludeUuid != null && excludeUuid.equals(online.getUniqueId())) {
+                continue;
+            }
+            String onlineIp = extractPlayerIp(online);
+            if (ip.equals(onlineIp)) {
+                count++;
+            }
+        }
+        return count;
     }
 
     private void forceClose(InboundConnection conn) {

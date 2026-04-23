@@ -401,6 +401,8 @@ public class FieldCommand implements SimpleCommand {
         msg(src, "<gray>Active Bans: <white>" + plugin.getBanManager().getTotalBans()
                 + " <gray>(IP + Name)");
         msg(src, "<gray>Online Players: <white>" + server.getPlayerCount());
+        msg(src, "<gray>Per-IP Online Limit: <white>" +
+                (plugin.getConfig().getMaxOnlinePerIp() <= 0 ? "DISABLED" : plugin.getConfig().getMaxOnlinePerIp()));
         msg(src, "<gray>TCP Connections: <white>" +
                 plugin.getConnectionInterceptor().getTotalConnectionCount());
         msg(src, "<gray>Tracked IPs: <white>" +
